@@ -1,0 +1,25 @@
+name: Daily Moodle Upload
+on:
+  schedule:
+    - cron: '0 2 * * *' # Runs at 2:00 AM UTC (7 AM PKT) every day
+  workflow_dispatch: # Allows manual start
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Upload Script
+        env:
+          CLIENT_ID: ${{ secrets.G_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.G_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.G_REFRESH_TOKEN }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          FOLDER_ID: ${{ secrets.FOLDER_ID }}
+        run: python upload.py
