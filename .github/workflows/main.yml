@@ -22,4 +22,4 @@ jobs:
           REFRESH_TOKEN: ${{ secrets.G_REFRESH_TOKEN }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           FOLDER_ID: ${{ secrets.FOLDER_ID }}
-        run: python upload.py
+        run: python3 upload.py
