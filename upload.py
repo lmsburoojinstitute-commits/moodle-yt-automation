@@ -1,6 +1,7 @@
 import os
 import datetime
 import time
+import re
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from google.oauth2.credentials import Credentials
@@ -8,9 +9,9 @@ import gspread
 import io
 
 # Config
-MIN_FILE_SIZE_MB = 5 
+MIN_FILE_SIZE_MB = 20 
 
-# Load Secrets from GitHub
+# Load Secrets
 CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 REFRESH_TOKEN = os.environ.get('REFRESH_TOKEN')
@@ -22,89 +23,105 @@ def get_services():
     creds = Credentials.from_authorized_user_info(info)
     return build('drive', 'v3', credentials=creds), build('youtube', 'v3', credentials=creds), gspread.authorize(creds)
 
+def get_next_class_number(youtube, playlist_id):
+    """Counts videos in playlist and returns next number."""
+    try:
+        res = youtube.playlists().list(part='contentDetails', id=playlist_id).execute()
+        count = res['items'][0]['contentDetails']['itemCount']
+        return count + 1
+    except:
+        return 1
+
+def format_date_from_filename(filename):
+    """Extracts YYYY/MM/DD from filename and returns (DD.Month)"""
+    match = re.search(r'(\d{4})/(\d{2})/(\d{2})', filename)
+    if match:
+        year, month_num, day = match.groups()
+        month_obj = datetime.datetime.strptime(month_num, "%m")
+        month_name = month_obj.strftime("%b") # e.g., "May"
+        return f"({day}.{month_name})"
+    return ""
+
 def main():
     drive, youtube, sheets = get_services()
     sh = sheets.open_by_key(SHEET_ID)
     mapping_sheet = sh.worksheet("Mapping")
     log_sheet = sh.worksheet("UploadLog")
     
-    # Get Mappings and filter out empty rows
-    all_mappings = mapping_sheet.get_all_records()
-    mappings = [m for m in all_mappings if str(m.get('Identifier', '')).strip() != ""]
-    
-    # Get Log and track what is already handled
+    mappings = mapping_sheet.get_all_records()
     logs = log_sheet.get_all_records()
-    # We skip anything that is NOT 'PENDING'
     handled_ids = {str(row['File ID']) for row in logs if row.get('Status') != 'PENDING'}
 
     query = f"'{FOLDER_ID}' in parents and mimeType='video/mp4' and trashed=false"
     results = drive.files().list(q=query, fields="files(id, name, size)").execute()
     files = results.get('files', [])
 
-    print(f"Found {len(files)} total files in Drive. Checking mapping...")
-
     for f in files:
         file_id = f['id']
         file_name = f['name']
         file_size_mb = int(f.get('size', 0)) / (1024 * 1024)
 
-        # 1. Skip if already processed (UPLOADED, SKIPPED, etc.)
-        if file_id in handled_ids:
-            continue
+        if file_id in handled_ids: continue
 
-        # 2. Check Mapping First
+        # Match Mapping
         match = next((m for m in mappings if str(m['Identifier']) in file_name), None)
-        
         if not match:
-            print(f"Skipping: {file_name} (No Course ID found in Mapping sheet)")
-            update_log(log_sheet, file_id, file_name, "SKIPPED_NO_MAPPING")
             continue
 
-        # 3. Check Size
         if file_size_mb < MIN_FILE_SIZE_MB:
-            print(f"Skipping: {file_name} (Too small: {round(file_size_mb, 2)} MB)")
-            update_log(log_sheet, file_id, file_name, "SKIPPED_TOO_SMALL")
             continue
 
-        # 4. If it passed all checks, START UPLOAD
-        print(f">>> MATCH FOUND: Uploading {file_name} to Playlist {match['Playlist ID']}")
+        print(f"Processing: {file_name}")
         try:
-            # Download
+            # 1. Generate the New Professional Title
+            date_part = format_date_from_filename(file_name)
+            class_num = get_next_class_number(youtube, match['Playlist ID'])
+            # Format: (05.May) Alim/Alimah Year 4 Summer Semester 26-27 | Class 15
+            new_title = f"{date_part} {match['Display Name']} {match['Suffix']} | Class {class_num}"
+            
+            # 2. Download
             request = drive.files().get_media(fileId=file_id)
             with io.FileIO("video.mp4", 'wb') as fh:
                 downloader = MediaIoBaseDownload(fh, request)
                 done = False
                 while not done: _, done = downloader.next_chunk()
             
-            # YouTube Upload
-            body = {'snippet': {'title': file_name, 'description': 'Moodle Automated Upload', 'categoryId': '27'}, 'status': {'privacyStatus': 'unlisted'}}
+            # 3. Upload to YouTube
+            body = {'snippet': {'title': new_title, 'description': 'Automated Upload', 'categoryId': '27'}, 'status': {'privacyStatus': 'unlisted'}}
             media = MediaFileUpload("video.mp4", chunksize=1024*1024, resumable=True)
             video = youtube.videos().insert(part='snippet,status', body=body, media_body=media).execute()
+            video_id = video['id']
             
-            # Add to Playlist
-            youtube.playlistItems().insert(part='snippet', body={'snippet': {'playlistId': match['Playlist ID'], 'resourceId': {'kind': 'youtube#video', 'videoId': video['id']}}}).execute()
+            # 4. Add to Playlist
+            youtube.playlistItems().insert(part='snippet', body={'snippet': {'playlistId': match['Playlist ID'], 'resourceId': {'kind': 'youtube#video', 'videoId': video_id}}}).execute()
 
-            # Mark as Success
-            update_log(log_sheet, file_id, file_name, "UPLOADED", f"https://youtu.be/{video['id']}")
-            print(f"SUCCESS: {file_name}")
+            # 5. Set Thumbnail
+            thumb_id = match.get('Thumbnail ID')
+            if thumb_id:
+                try:
+                    t_request = drive.files().get_media(fileId=thumb_id)
+                    with io.FileIO("thumb.jpg", 'wb') as tfh:
+                        t_downloader = MediaIoBaseDownload(tfh, t_request)
+                        t_done = False
+                        while not t_done: _, t_done = t_downloader.next_chunk()
+                    youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload("thumb.jpg")).execute()
+                    os.remove("thumb.jpg")
+                except Exception as te:
+                    print(f"Thumbnail failed: {te}")
+
+            # 6. Log Success
+            try:
+                cell = log_sheet.find(file_id)
+                log_sheet.update(f"C{cell.row}:E{cell.row}", [["UPLOADED", str(datetime.datetime.now()), f"https://youtu.be/{video_id}"]])
+            except:
+                log_sheet.append_row([file_id, file_name, "UPLOADED", str(datetime.datetime.now()), f"https://youtu.be/{video_id}"])
+            
+            print(f"Successfully uploaded: {new_title}")
             os.remove("video.mp4")
-            
-        except Exception as e:
-            print(f"ERROR processing {file_name}: {e}")
-            # We don't mark as UPLOADED so it can retry tomorrow once, 
-            # but if it's a Quota error, it will stop the whole script.
-            if "quotaExceeded" in str(e):
-                print("YouTube Daily Quota Hit. Stopping for today.")
-                break
 
-def update_log(sheet, file_id, name, status, link=""):
-    # Finds the row with the File ID and updates it, or appends a new one
-    try:
-        cell = sheet.find(file_id)
-        row = cell.row
-        sheet.update(f"C{row}:E{row}", [[status, str(datetime.datetime.now()), link]])
-    except:
-        sheet.append_row([file_id, name, status, str(datetime.datetime.now()), link])
+        except Exception as e:
+            print(f"Error: {e}")
+            if "quotaExceeded" in str(e): break
 
 if __name__ == "__main__":
     main()
