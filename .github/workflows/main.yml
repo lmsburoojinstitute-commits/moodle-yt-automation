@@ -1,7 +1,7 @@
 name: Daily Moodle Upload
 on:
   schedule:
-    - cron: '0 2 * * *' # Runs at 2:00 AM UTC (7 AM PKT) every day
+    - cron: '0 23 * * *' # This is 11 PM UTC, which is 4 AM Pakistan Time
   workflow_dispatch: # Allows manual start
 
 jobs:
