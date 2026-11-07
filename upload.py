@@ -23,6 +23,24 @@ def get_services():
     creds = Credentials.from_authorized_user_info(info)
     return build('drive', 'v3', credentials=creds), build('youtube', 'v3', credentials=creds), gspread.authorize(creds)
 
+def list_all_videos(drive, folder_id):
+    """Lists ALL mp4 files in the folder, following nextPageToken until done."""
+    files = []
+    page_token = None
+    query = f"'{folder_id}' in parents and mimeType='video/mp4' and trashed=false"
+    while True:
+        res = drive.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, size)",
+            pageSize=1000,
+            pageToken=page_token
+        ).execute()
+        files.extend(res.get('files', []))
+        page_token = res.get('nextPageToken')
+        if not page_token:
+            break
+    return files
+
 def get_next_class_number(youtube, playlist_id):
     """Counts videos in playlist and returns next number."""
     try:
@@ -52,9 +70,15 @@ def main():
     logs = log_sheet.get_all_records()
     handled_ids = {str(row['File ID']) for row in logs if row.get('Status') != 'PENDING'}
 
-    query = f"'{FOLDER_ID}' in parents and mimeType='video/mp4' and trashed=false"
-    results = drive.files().list(q=query, fields="files(id, name, size)").execute()
-    files = results.get('files', [])
+    # Paginated listing (previously a single call capped at 100 files)
+    files = list_all_videos(drive, FOLDER_ID)
+    print(f"Drive returned {len(files)} videos")
+
+    # Diagnostic: PENDING rows that Drive did not return
+    seen_ids = {f['id'] for f in files}
+    for r in logs:
+        if r.get('Status') == 'PENDING' and str(r['File ID']) not in seen_ids:
+            print(f"PENDING but NOT returned by Drive API: {r['File Name']}")
 
     for f in files:
         file_id = f['id']
@@ -66,9 +90,11 @@ def main():
         # Match Mapping
         match = next((m for m in mappings if str(m['Identifier']) in file_name), None)
         if not match:
+            print(f"Skip (no mapping match): {file_name}")
             continue
 
         if file_size_mb < MIN_FILE_SIZE_MB:
+            print(f"Skip (too small, {file_size_mb:.1f} MB): {file_name}")
             continue
 
         print(f"Processing: {file_name}")
@@ -120,7 +146,7 @@ def main():
             os.remove("video.mp4")
 
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"Error on {file_name}: {e}")
             if "quotaExceeded" in str(e): break
 
 if __name__ == "__main__":
